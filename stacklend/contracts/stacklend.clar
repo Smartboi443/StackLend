@@ -10,6 +10,20 @@
 (define-constant ERR-LOAN-NOT-DUE (err u105))
 (define-constant ERR-LOAN-DEFAULTED (err u106))
 (define-constant ERR-INVALID-PRINCIPAL (err u107))
+(define-constant ERR-PAYMENT-TOO-SMALL (err u108))
+(define-constant ERR-NO-LIQUIDATION-NEEDED (err u109))
+
+;; Constants
+(define-constant BLOCKS-PER-DAY u144) ;; Approximate number of blocks per day
+(define-constant PENALTY-RATE u10) ;; 10% penalty rate for late payments
+(define-constant LIQUIDATION-THRESHOLD u130) ;; 130% minimum collateral ratio before liquidation
+
+;; Status constants
+(define-constant STATUS-PENDING "PENDING")
+(define-constant STATUS-ACTIVE "ACTIVE")
+(define-constant STATUS-REPAID "REPAID")
+(define-constant STATUS-LIQUIDATED "LIQUIDATED")
+(define-constant STATUS-DEFAULTED "DEFAULTED")
 
 ;; Data variables
 (define-data-var minimum-collateral-ratio uint u150) ;; 150% collateralization ratio
@@ -26,12 +40,23 @@
         interest-rate: uint,
         duration: uint,
         start-height: uint,
+        last-payment-height: uint,
+        payment-interval: uint,
+        payment-amount: uint,
+        remaining-amount: uint,
         status: (string-ascii 20)
     }
 )
 
-;; User balances for STX
-(define-map user-balances principal uint)
+;; Payment schedule tracking
+(define-map payment-schedules
+    {loan-id: uint}
+    {
+        next-payment-height: uint,
+        missed-payments: uint,
+        total-penalties: uint
+    }
+)
 
 ;; Contract state variables
 (define-data-var next-loan-id uint u1)
@@ -42,8 +67,8 @@
     (map-get? loans {loan-id: loan-id})
 )
 
-(define-read-only (get-user-balance (user principal))
-    (default-to u0 (map-get? user-balances user))
+(define-read-only (get-payment-schedule (loan-id uint))
+    (map-get? payment-schedules {loan-id: loan-id})
 )
 
 (define-read-only (get-collateral-ratio (collateral uint) (loan-amount uint))
@@ -55,39 +80,58 @@
     )
 )
 
-(define-read-only (get-total-stx-locked)
-    (var-get total-stx-locked)
+(define-read-only (get-current-collateral-ratio (loan-id uint))
+    (let
+        (
+            (loan (unwrap! (get-loan loan-id) u0))
+            (ratio (get-collateral-ratio (get collateral loan) (get remaining-amount loan)))
+        )
+        ratio
+    )
+)
+
+(define-read-only (check-liquidation-needed (loan-id uint))
+    (let
+        (
+            (current-ratio (get-current-collateral-ratio loan-id))
+        )
+        (< current-ratio LIQUIDATION-THRESHOLD)
+    )
 )
 
 ;; Private functions
-(define-private (update-user-balance (user principal) (amount uint) (add bool))
-    (let
-        (
-            (current-balance (get-user-balance user))
-            (new-balance (if add
-                (+ current-balance amount)
-                (- current-balance amount)))
+(define-private (calculate-penalty (payment-amount uint))
+    (/ (* payment-amount PENALTY-RATE) u100)
+)
+
+(define-private (update-payment-schedule (loan-id uint) (start-height uint) (payment-interval uint))
+    (begin
+        (map-set payment-schedules
+            {loan-id: loan-id}
+            {
+                next-payment-height: (+ start-height payment-interval),
+                missed-payments: u0,
+                total-penalties: u0
+            }
         )
-        (map-set user-balances user new-balance)
-        (ok new-balance)
+        true
     )
 )
 
 ;; Public functions
-(define-public (create-loan (amount uint) (collateral uint) (interest-rate uint) (duration uint))
+(define-public (create-loan (amount uint) (collateral uint) (interest-rate uint) (duration uint) (payment-interval uint))
     (let
         (
             (loan-id (var-get next-loan-id))
             (collateral-ratio (get-collateral-ratio collateral amount))
+            (payment-amount (/ (+ amount (* amount interest-rate)) duration))
         )
         (asserts! (>= collateral-ratio (var-get minimum-collateral-ratio)) ERR-INSUFFICIENT-COLLATERAL)
         (asserts! (> amount u0) ERR-INVALID-PRINCIPAL)
         (try! (stx-transfer? collateral tx-sender (as-contract tx-sender)))
         
-        ;; Update total STX locked
         (var-set total-stx-locked (+ (var-get total-stx-locked) collateral))
         
-        ;; Create new loan
         (map-set loans
             {loan-id: loan-id}
             {
@@ -98,7 +142,11 @@
                 interest-rate: interest-rate,
                 duration: duration,
                 start-height: u0,
-                status: "PENDING"
+                last-payment-height: u0,
+                payment-interval: payment-interval,
+                payment-amount: payment-amount,
+                remaining-amount: amount,
+                status: STATUS-PENDING
             }
         )
         (var-set next-loan-id (+ loan-id u1))
@@ -112,80 +160,85 @@
             (loan (unwrap! (get-loan loan-id) ERR-LOAN-NOT-FOUND))
             (amount (get amount loan))
         )
-        (asserts! (is-eq (get status loan) "PENDING") ERR-LOAN-ALREADY-ACTIVE)
+        (asserts! (is-eq (get status loan) STATUS-PENDING) ERR-LOAN-ALREADY-ACTIVE)
         (try! (stx-transfer? amount tx-sender (get borrower loan)))
         
-        ;; Update loan status
         (map-set loans
             {loan-id: loan-id}
             (merge loan {
                 lender: (some tx-sender),
                 start-height: block-height,
-                status: "ACTIVE"
+                last-payment-height: block-height,
+                status: STATUS-ACTIVE
             })
         )
+        
+        (asserts! (update-payment-schedule loan-id block-height (get payment-interval loan)) ERR-LOAN-NOT-FOUND)
+        
         (ok true)
     )
 )
 
-(define-public (repay-loan (loan-id uint))
+(define-public (make-payment (loan-id uint))
     (let
         (
             (loan (unwrap! (get-loan loan-id) ERR-LOAN-NOT-FOUND))
-            (total-amount (+ (get amount loan) 
-                           (/ (* (get amount loan) (get interest-rate loan)) u100)))
+            (schedule (unwrap! (get-payment-schedule loan-id) ERR-LOAN-NOT-FOUND))
+            (payment-amount (get payment-amount loan))
             (lender (unwrap! (get lender loan) ERR-LOAN-NOT-FOUND))
+            (penalty (if (>= block-height (get next-payment-height schedule))
+                        (calculate-penalty payment-amount)
+                        u0))
+            (total-payment (+ payment-amount penalty))
         )
-        (asserts! (is-eq (get status loan) "ACTIVE") ERR-LOAN-NOT-FOUND)
+        (asserts! (is-eq (get status loan) STATUS-ACTIVE) ERR-LOAN-NOT-FOUND)
         (asserts! (is-eq (get borrower loan) tx-sender) ERR-NOT-AUTHORIZED)
         
-        ;; Transfer repayment to lender
-        (try! (stx-transfer? total-amount tx-sender lender))
+        (try! (stx-transfer? total-payment tx-sender lender))
         
-        ;; Return collateral to borrower
-        (as-contract
-            (try! (stx-transfer? (get collateral loan) tx-sender tx-sender))
-        )
-        
-        ;; Update total STX locked
-        (var-set total-stx-locked (- (var-get total-stx-locked) (get collateral loan)))
-        
-        ;; Update loan status
         (map-set loans
             {loan-id: loan-id}
             (merge loan {
-                status: "REPAID"
+                last-payment-height: block-height,
+                remaining-amount: (- (get remaining-amount loan) payment-amount)
             })
         )
+        
+        (map-set payment-schedules
+            {loan-id: loan-id}
+            (merge schedule {
+                next-payment-height: (+ block-height (get payment-interval loan)),
+                total-penalties: (+ (get total-penalties schedule) penalty)
+            })
+        )
+        
         (ok true)
     )
 )
 
-(define-public (liquidate-loan (loan-id uint))
+(define-public (check-and-liquidate (loan-id uint))
     (let
         (
             (loan (unwrap! (get-loan loan-id) ERR-LOAN-NOT-FOUND))
-            (loan-end-height (+ (get start-height loan) (get duration loan)))
+            (schedule (unwrap! (get-payment-schedule loan-id) ERR-LOAN-NOT-FOUND))
             (lender (unwrap! (get lender loan) ERR-LOAN-NOT-FOUND))
+            (needs-liquidation (check-liquidation-needed loan-id))
         )
-        (asserts! (is-eq (get status loan) "ACTIVE") ERR-LOAN-NOT-FOUND)
-        (asserts! (>= block-height loan-end-height) ERR-LOAN-NOT-DUE)
+        (asserts! needs-liquidation ERR-NO-LIQUIDATION-NEEDED)
         
-        ;; Transfer collateral to lender
         (as-contract
             (try! (stx-transfer? (get collateral loan) lender tx-sender))
         )
         
-        ;; Update total STX locked
         (var-set total-stx-locked (- (var-get total-stx-locked) (get collateral loan)))
         
-        ;; Update loan status
         (map-set loans
             {loan-id: loan-id}
             (merge loan {
-                status: "DEFAULTED"
+                status: STATUS-LIQUIDATED
             })
         )
+        
         (ok true)
     )
 )
